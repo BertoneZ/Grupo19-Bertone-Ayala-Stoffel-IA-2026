@@ -1,0 +1,1 @@
+# Grupo19-Bertone-Ayala-Stoffel-IA-2026
