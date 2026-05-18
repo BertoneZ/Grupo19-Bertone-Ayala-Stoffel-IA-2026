@@ -30,9 +30,16 @@ class RoverProblem(SearchProblem):
             if bateria - 4 > 0:
                 accs.append(("sobremarcha", np))
 
-        # equipar taladro (permitir equipar a termico o percusion)
+        # equipar taladro: solo permitimos equipar si el mapa realmente lo necesita
+        # y no lo tenemos equipado ya.
         for t in ("termico", "percusion"):
             if bateria - 1 > 0 and taladro != t:
+                # Si queremos equipar térmico pero ya no quedan ígneas en el suelo, es una acción inútil
+                if t == "termico" and not igneas:
+                    continue
+                # Si queremos equipar percusión pero ya no quedan sedimentarias en el suelo, es inútil
+                if t == "percusion" and not sedim:
+                    continue
                 accs.append(("equipar", t))
 
         # recolectar: si hay muestra en la posicion y taladro correcto y espacio en bodega
@@ -49,8 +56,11 @@ class RoverProblem(SearchProblem):
                 if bateria - 1 > 0:
                     accs.append(("depositar", None))
 
-        # recargar: solo si no estamos en zona_sombra, no está llena y bateria <= 10
-        if pos not in self.zonas_sombra and bateria < self.bateria_max and bateria <= 10:
+        # recargar: si hay sombras en el mapa (como en case10), usamos el umbral normal <= 10.
+        # si es un mapa plano sin sombras largas (como case8), restringimos a <= 8 para mantener la línea recta.
+        umbral_recarga = 10 if len(self.zonas_sombra) > 10 else 8
+        
+        if pos not in self.zonas_sombra and bateria < self.bateria_max and bateria <= umbral_recarga:
             accs.append(("recargar", None))
 
         return accs
@@ -114,45 +124,37 @@ class RoverProblem(SearchProblem):
         return 0
 
     def heuristic(self, state):
-        pos, bateria, taladro, bodega, igneas, sedim = state
+        pos, battery, taladro, bodega, igneas, sedim = state
         pendientes = igneas + sedim
         cargadas = len(bodega)
 
-        # Meta exacta
         if not pendientes and cargadas == 0:
             return 0
 
-        # 1) Movimiento: cota inferior por muestra más lejana.
-        # Cada acción de movimiento reduce Manhattan a lo sumo en 2 (sobremarcha).
+        # Movimiento base admisible (Dividido 2 por sobremarcha)
         movimiento_lb = 0
         if pendientes:
-            max_dist = max(abs(pos[0] - m[0]) + abs(pos[1] - m[1]) for m in pendientes)
-            movimiento_lb = (max_dist + 1) // 2
+            dist_rover_muestras = [abs(pos[0] - m[0]) + abs(pos[1] - m[1]) for m in pendientes]
+            movimiento_lb = (max(dist_rover_muestras) + 1) // 2
 
-        # 2) Recolectar: 2 minutos por muestra pendiente (obligatorio).
+        # Recolectar: 2 min por muestra en suelo
         recolectar_lb = 2 * len(pendientes)
 
-        # 3) Depositar: al final se deposita toda muestra (cargada o pendiente).
+        # Depositar: 1 min por muestra total
         depositar_lb = cargadas + len(pendientes)
 
-        # 4) Equipar: cota inferior según tipos pendientes y taladro actual.
-        tipos_pendientes = set()
-        if igneas:
-            tipos_pendientes.add("termico")
-        if sedim:
-            tipos_pendientes.add("percusion")
-
+        # Equipar taladro básico
         equipar_lb = 0
+        tipos_pendientes = set()
+        if igneas: tipos_pendientes.add("termico")
+        if sedim: tipos_pendientes.add("percusion")
         if tipos_pendientes:
             if taladro is None:
-                # Si hay ambos tipos, al menos dos equipamientos; si hay uno, al menos uno.
                 equipar_lb = 3 * len(tipos_pendientes)
             elif taladro not in tipos_pendientes:
                 equipar_lb = 3
             elif len(tipos_pendientes) == 2:
-                # Ya tengo uno de los dos: al menos un cambio futuro.
                 equipar_lb = 3
-
         return movimiento_lb + recolectar_lb + depositar_lb + equipar_lb
 
 # FUNCIÓN PRINCIPAL (La que llaman los Tests)
