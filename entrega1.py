@@ -1,12 +1,9 @@
 from simpleai.search import SearchProblem, astar, breadth_first, depth_first
 from simpleai.search.viewers import WebViewer, BaseViewer
 
-# entrega1.py
-# Implementación de un problema de búsqueda para planear las acciones de un rover.
 # - El archivo define la clase `RoverProblem` que adapta el estado del rover a la API
 #   de simpleai.search/SearchProblem (actions/result/is_goal/cost/heuristic).
-# - La función `planear_rover` crea el problema y ejecuta A* para obtener una lista
-#   de acciones que luego devuelve.
+# - La función `planear_rover` crea el problema y ejecuta A* para obtener una lista de acciones que luego devuelve.
 
 class RoverProblem(SearchProblem):
     def __init__(self, estado_inicial, bateria_max, zonas_sombra, muestras_igneas, muestras_sedimentarias):
@@ -28,7 +25,7 @@ class RoverProblem(SearchProblem):
         pos, bateria, taladro, bodega, igneas, sedim = state
         accs = []
 
-        # 1) Movimientos básicos (una casilla ortogonal): consumen 1 de batería.
+        # 1) Movimientos básicos (casillas adyacentes): consumen 1 de batería.
         r, c = pos
         vecinos = [ (r+1, c), (r-1, c), (r, c+1), (r, c-1) ]
         for np in vecinos:
@@ -52,23 +49,20 @@ class RoverProblem(SearchProblem):
                     continue
                 accs.append(("equipar", t))
 
-        # 4) Recolectar muestra si estamos sobre una posición objetivo, tenemos el taladro
-        # correcto, espacio en bodega y batería suficiente (3).
+        # 4) Recolectar muestra si estamos sobre una posición objetivo, tenemos el taladro correcto, espacio en bodega y batería suficiente (3).
         if pos in igneas and taladro == "termico" and len(bodega) < 2 and bateria - 3 > 0:
             accs.append(("recolectar", "ignea"))
         if pos in sedim and taladro == "percusion" and len(bodega) < 2 and bateria - 3 > 0:
             accs.append(("recolectar", "sedimentaria"))
 
-        # 5) Depositar muestras en el punto base: solo permitido cuando la bodega
-        # tiene 2 muestras o quedan 0 muestras pendientes (se permite depositar 1).
+        # 5) Depositar muestras en el punto base: solo permitido cuando la bodega tiene 2 muestras o quedan 0 muestras pendientes (se permite depositar 1).
         remaining_samples = tuple(igneas) + tuple(sedim)
         if len(bodega) > 0:
             if len(bodega) == 2 or (len(bodega) == 1 and not remaining_samples):
                 if bateria - 1 > 0:
                     accs.append(("depositar", None))
 
-        # 6) Recargar: solo si NO estamos en zona de sombra y la batería está por debajo
-        # de un umbral razonable. El umbral se ajusta ligeramente según la presencia de sombras.
+        # 6) Recargar: solo si NO estamos en zona de sombra y la batería está por debajo de un umbral razonable. El umbral se ajusta ligeramente según la presencia de sombras.
         umbral_recarga = 10 if len(self.zonas_sombra) > 10 else 8
         if pos not in self.zonas_sombra and bateria < self.bateria_max and bateria <= umbral_recarga:
             accs.append(("recargar", None))
