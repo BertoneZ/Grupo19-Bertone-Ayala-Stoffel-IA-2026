@@ -3,9 +3,11 @@ from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 # Cargar datasets
 train = pd.read_csv("data/solicitudes_train.csv")
 test = pd.read_csv("data/solicitudes_test.csv")
@@ -92,55 +94,74 @@ bancario["Mes_Referencia"] = pd.to_datetime(bancario["Mes_Referencia"])
 
 # FEATURES BANCARIAS: SOLO LOS SEIS MESES ANTERIORES
 def construir_features_bancarias(solicitudes, historial):
-    assert solicitudes["ID_Solicitud"].is_unique
-    assert not historial.duplicated(
-        ["ID_Usuario", "Mes_Referencia"]
-    ).any()
-    cruces = solicitudes[
-        ["ID_Solicitud", "ID_Usuario", "Fecha_Solicitud"]
-    ].merge(historial, on="ID_Usuario", how="left")
+    # Verificaciones de integridad iniciales
+    assert "ID_Usuario" in solicitudes.columns and "ID_Solicitud" in solicitudes.columns
+    assert "ID_Usuario" in historial.columns and "Mes_Referencia" in historial.columns
+    assert not solicitudes["ID_Solicitud"].duplicated().any()
+    assert not historial.duplicated(subset=["ID_Usuario", "Mes_Referencia"]).any()
 
-    # Incluye seis meses anteriores; excluye el mes de solicitud.
-    inicio = cruces["Fecha_Solicitud"] - pd.DateOffset(months=6)
-    anteriores = cruces.loc[
-        (cruces["Mes_Referencia"] >= inicio)
-        & (cruces["Mes_Referencia"] < cruces["Fecha_Solicitud"])
-    ].copy()
-
-    assert (
-        anteriores["Mes_Referencia"] < anteriores["Fecha_Solicitud"]
-    ).all()
-
-    anteriores["Tuvo_Atraso"] = (
-        anteriores["Dias_Atraso_Otras_Deudas"] > 0
+    # Cruce de solicitudes con historial bancario
+    cruces = solicitudes[["ID_Solicitud", "ID_Usuario", "Fecha_Solicitud"]].merge(
+        historial, on="ID_Usuario", how="left"
     )
 
-    features = anteriores.groupby("ID_Solicitud").agg(
+    # Ventana de 6 meses (comportamiento general reciente)
+    inicio_6m = cruces["Fecha_Solicitud"] - pd.DateOffset(months=6)
+    mask_6m = (cruces["Mes_Referencia"] >= inicio_6m) & (cruces["Mes_Referencia"] < cruces["Fecha_Solicitud"])
+    anteriores_6m = cruces[mask_6m].copy()
+    anteriores_6m["Tuvo_Atraso"] = (anteriores_6m["Dias_Atraso_Otras_Deudas"] > 0).astype(int)
+
+    # Ventana de 3 meses (riesgo a corto plazo)
+    inicio_3m = cruces["Fecha_Solicitud"] - pd.DateOffset(months=3)
+    mask_3m = (cruces["Mes_Referencia"] >= inicio_3m) & (cruces["Mes_Referencia"] < cruces["Fecha_Solicitud"])
+    anteriores_3m = cruces[mask_3m].copy()
+    anteriores_3m["Tuvo_Atraso_3m"] = (anteriores_3m["Dias_Atraso_Otras_Deudas"] > 0).astype(int)
+
+    # Resumen 6 meses
+    resumen_6m = anteriores_6m.groupby("ID_Solicitud").agg(
         Saldo_Promedio_6m=("Saldo_Promedio_Mensual", "mean"),
         Saldo_Desviacion_6m=("Saldo_Promedio_Mensual", "std"),
         Atraso_Maximo_6m=("Dias_Atraso_Otras_Deudas", "max"),
         Proporcion_Meses_Atraso_6m=("Tuvo_Atraso", "mean"),
         Meses_Observados_6m=("Mes_Referencia", "count"),
+        Saldo_Ultimo_Disponible_6m=("Saldo_Promedio_Mensual", "last"),
     )
 
-    ultimos = anteriores.sort_values("Mes_Referencia").drop_duplicates(
-        "ID_Solicitud", keep="last"
+    # Resumen 3 meses
+    resumen_3m = anteriores_3m.groupby("ID_Solicitud").agg(
+        Saldo_Promedio_3m=("Saldo_Promedio_Mensual", "mean"),
+        Atraso_Maximo_3m=("Dias_Atraso_Otras_Deudas", "max"),
+        Proporcion_Meses_Atraso_3m=("Tuvo_Atraso_3m", "mean"),
     )
-    features["Saldo_Ultimo_Disponible_6m"] = ultimos.set_index(
-        "ID_Solicitud"
-    )["Saldo_Promedio_Mensual"]
+
+    resumen_total = resumen_6m.join(resumen_3m, how="left")
+
+    # Tratamiento de nulos
+    resumen_total["Saldo_Desviacion_6m"] = resumen_total["Saldo_Desviacion_6m"].fillna(0)
+    resumen_total["Saldo_Promedio_3m"] = resumen_total["Saldo_Promedio_3m"].fillna(resumen_total["Saldo_Promedio_6m"])
+    resumen_total["Atraso_Maximo_3m"] = resumen_total["Atraso_Maximo_3m"].fillna(0)
+    resumen_total["Proporcion_Meses_Atraso_3m"] = resumen_total["Proporcion_Meses_Atraso_3m"].fillna(0)
+
+    # Tendencia de liquidez: si el último saldo es menor al promedio, viene gastando de más
+    resumen_total["Tendencia_Saldo_Reciente"] = (
+        resumen_total["Saldo_Ultimo_Disponible_6m"] - resumen_total["Saldo_Promedio_6m"]
+    )
 
     resultado = solicitudes.merge(
-        features, on="ID_Solicitud", how="left", validate="one_to_one"
+        resumen_total, on="ID_Solicitud", how="left", validate="one_to_one"
     )
-    resultado["Meses_Observados_6m"] = (
-        resultado["Meses_Observados_6m"].fillna(0).astype(int)
-    )
-    assert len(resultado) == len(solicitudes)
-    assert resultado["ID_Solicitud"].equals(solicitudes["ID_Solicitud"])
-    assert resultado["Meses_Observados_6m"].between(0, 6).all()
-    return resultado
 
+    cols_a_cero = [
+        "Atraso_Maximo_6m", "Proporcion_Meses_Atraso_6m", "Meses_Observados_6m",
+        "Atraso_Maximo_3m", "Proporcion_Meses_Atraso_3m", "Tendencia_Saldo_Reciente"
+    ]
+    for c in cols_a_cero:
+        resultado[c] = resultado[c].fillna(0)
+
+    for c in ["Saldo_Promedio_6m", "Saldo_Desviacion_6m", "Saldo_Ultimo_Disponible_6m", "Saldo_Promedio_3m"]:
+        resultado[c] = resultado[c].fillna(resultado[c].median())
+
+    return resultado
 train_features = construir_features_bancarias(train, bancario)
 test_features = construir_features_bancarias(test, bancario)
 train_features["Relacion_Monto_Ingreso"] = (
@@ -148,6 +169,13 @@ train_features["Relacion_Monto_Ingreso"] = (
 )
 test_features["Relacion_Monto_Ingreso"] = (
     test_features["Monto_Solicitado"] / test_features["Ingreso_Mensual"]
+)
+
+train_features["Interes_Total_Pagar"] = (
+    train_features["Monto_Solicitado"] * train_features["Tasa_Interes"]
+)
+test_features["Interes_Total_Pagar"] = (
+    test_features["Monto_Solicitado"] * test_features["Tasa_Interes"]
 )
 
 columnas_features = [
@@ -187,8 +215,19 @@ columnas_predictoras = [
     "Tasa_Interes",
     "Ingreso_Mensual",
     "Relacion_Monto_Ingreso",
+    "Interes_Total_Pagar",
     "Motivo_Prestamo",
-] + columnas_features
+    "Saldo_Promedio_6m",
+    "Saldo_Desviacion_6m",
+    "Atraso_Maximo_6m",
+    "Proporcion_Meses_Atraso_6m",
+    "Meses_Observados_6m",
+    "Saldo_Ultimo_Disponible_6m",
+    "Saldo_Promedio_3m",
+    "Atraso_Maximo_3m",
+    "Proporcion_Meses_Atraso_3m",
+    "Tendencia_Saldo_Reciente",
+]
 X_train = entrenamiento[columnas_predictoras].copy()
 y_train = entrenamiento["Estado_Final"].copy()
 X_validacion = validacion[columnas_predictoras].copy()
@@ -220,29 +259,34 @@ print("Dimensiones X_validacion:", X_validacion.shape)
 print("Dimensiones X_test:", X_test.shape)
 print("Variables predictoras:", columnas_predictoras)
 
-# REGRESION LOGISTICA: PREPARAR, APRENDER Y EVALUAR
+# REGRESION LOGISTICA REGULARIZADA CON STANDARSCALER
 columnas_numericas = [c for c in columnas_predictoras if c != "Motivo_Prestamo"]
-# Estandarizar coloca las variables numericas en escalas comparables.
-# One-hot crea una columna 0/1 por motivo, sin inventar un orden entre motivos.
+
 preparacion = ColumnTransformer([
     ("numericas", StandardScaler(), columnas_numericas),
     ("motivo", OneHotEncoder(handle_unknown="ignore"), ["Motivo_Prestamo"]),
 ])
 
-# El pipeline aprende el escalado, las categorias y el modelo solo con train.
+# Asignamos mayor peso a la clase 0 (Default) para penalizar el error más costoso
 modelo_logistico = Pipeline([
     ("preparacion", preparacion),
-    ("modelo", LogisticRegression(max_iter=1000)),
+    ("modelo", LogisticRegression(
+        C=0.05,
+        class_weight={0: 2.2, 1: 1.0},
+        max_iter=1000,
+        random_state=42
+    )),
 ])
+
 modelo_logistico.fit(X_train, y_train)
 
-# Clase 1 = pago. La clasificacion usa un umbral de 0.5 para esta evaluacion.
-# Clasificar como pago no es todavia una decision de aprobar el prestamo.
+
+# Predicciones y probabilidades de pago en validacion
 predicciones_validacion = modelo_logistico.predict(X_validacion)
 indice_pago = list(modelo_logistico.classes_).index(1)
 probabilidades_pago_validacion = modelo_logistico.predict_proba(X_validacion)[:, indice_pago]
 
-# Referencia sencilla: predecir siempre la clase mas frecuente en train.
+# Referencia sencilla: baseline
 baseline = DummyClassifier(strategy="most_frequent")
 baseline.fit(X_train, y_train)
 predicciones_baseline = baseline.predict(X_validacion)
@@ -252,7 +296,6 @@ probabilidades_baseline = baseline.predict_proba(X_validacion)[:, list(baseline.
 def mostrar_evaluacion(nombre, reales, predicciones, probabilidades):
     print(f"\n--- EVALUACION: {nombre} ---")
     print(f"Accuracy: {accuracy_score(reales, predicciones):.4f}")
-    # ROC-AUC necesita ejemplos de ambas clases.
     if reales.nunique() == 2:
         print(f"ROC-AUC (probabilidad de pago): {roc_auc_score(reales, probabilidades):.4f}")
     print("Matriz: filas = resultado real; columnas = prediccion")
@@ -273,7 +316,6 @@ mostrar_evaluacion(
     predicciones_validacion, probabilidades_pago_validacion,
 )
 
-# Evaluar tambien solicitudes de personas ausentes del entrenamiento.
 mascara_nuevos = ~validacion["ID_Usuario"].isin(usuarios_train)
 if mascara_nuevos.any():
     mostrar_evaluacion(
@@ -301,7 +343,7 @@ def seleccionar_prestamos(solicitudes, probabilidades_pago):
         raise ValueError("Debe haber una probabilidad por solicitud")
     if not solicitudes["ID_Solicitud"].is_unique:
         raise ValueError("Los IDs de solicitud deben ser unicos")
-    # Seleccionar solo estos datos impide utilizar Estado_Final por accidente.
+
     seleccion = solicitudes[
         ["ID_Solicitud", "Monto_Solicitado", "Tasa_Interes"]
     ].copy().set_index("ID_Solicitud")
@@ -309,6 +351,7 @@ def seleccionar_prestamos(solicitudes, probabilidades_pago):
     p = seleccion["Probabilidad_Pago"]
     monto = seleccion["Monto_Solicitado"]
     tasa = seleccion["Tasa_Interes"]
+
     if not p.between(0, 1).all():
         raise ValueError("Las probabilidades deben estar entre 0 y 1, sin nulos")
     if not monto.between(1, float("inf"), inclusive="left").all():
@@ -319,16 +362,27 @@ def seleccionar_prestamos(solicitudes, probabilidades_pago):
     seleccion["Ganancia_Esperada"] = p * monto * tasa - (1 - p) * monto
     seleccion["Rentabilidad_Esperada"] = seleccion["Ganancia_Esperada"] / monto
     seleccion["Aprobar"] = 0
-    candidatos = seleccion.loc[seleccion["Ganancia_Esperada"] > 0].sort_values(
+
+    # Filtro: candidatos con rentabilidad positiva y probabilidad sobre el umbral de seguridad
+    umbral_minimo = 1.0 / (1.0 + tasa) + 0.03
+    filtro_seguro = (seleccion["Ganancia_Esperada"] > 0) & (seleccion["Probabilidad_Pago"] >= umbral_minimo)
+
+    candidatos = seleccion.loc[filtro_seguro].sort_values(
         "Rentabilidad_Esperada", ascending=False, kind="stable"
     )
+
+    if candidatos["Monto_Solicitado"].sum() < PRESUPUESTO:
+        resto = seleccion.loc[
+            (seleccion["Ganancia_Esperada"] > 0) & (~filtro_seguro)
+        ].sort_values("Rentabilidad_Esperada", ascending=False, kind="stable")
+        candidatos = pd.concat([candidatos, resto])
+
     capital_utilizado = 0
     for id_solicitud, prestamo in candidatos.iterrows():
         monto_solicitado = prestamo["Monto_Solicitado"]
         if capital_utilizado + monto_solicitado <= PRESUPUESTO:
             seleccion.loc[id_solicitud, "Aprobar"] = 1
             capital_utilizado += monto_solicitado
-        # Si no cabe, seguimos buscando otros prestamos que si puedan caber.
 
     capital_aprobado = seleccion.loc[
         seleccion["Aprobar"] == 1, "Monto_Solicitado"
