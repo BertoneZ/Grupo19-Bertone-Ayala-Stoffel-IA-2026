@@ -6,13 +6,15 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 from datos import cargar_datos
 from features import (
-    FEATURE_CATEGORICA, FEATURES_BASE, FEATURES_MONTO,
-    construir_features, estimar_factor_escala, resumir_historial_bancario,
+    FEATURE_CATEGORICA, FEATURES_BASE, FEATURES_MONTO, FEATURES_PRIMER_INTENTO,
+    construir_features, construir_features_primer_intento, estimar_factor_escala, resumir_historial_bancario,
 )
+from graficos import grafico_escala_y_ganancia, grafico_pagan_vs_no_pagan
 from modelos import SEMILLA, LightGBMVariasSemillas, crear_ensamble, crear_logistica
 from negocio import PRESUPUESTO, guardar_submission, seleccionar_prestamos, simular_ganancia_como_test
 
 CARPETA_SALIDA = Path(__file__).parent / "submissions"
+CARPETA_GRAFICOS = Path(__file__).parent / "graficos"
 
 
 def predecir_fuera_de_muestra(crear_modelo, datos, features):
@@ -48,19 +50,38 @@ def main():
     prob_lgbm = predecir_fuera_de_muestra(lambda: LightGBMVariasSemillas(features_A, FEATURE_CATEGORICA), train_f, columnas_A)
     prob_logistica_B = predecir_fuera_de_muestra(lambda: crear_logistica(features_B, FEATURE_CATEGORICA), train_f, columnas_B)
     prob_lgbm_B = predecir_fuera_de_muestra(lambda: LightGBMVariasSemillas(features_B, FEATURE_CATEGORICA), train_f, columnas_B)
+    train_primer_intento = construir_features_primer_intento(train, bancario)
+    prob_primer_intento = predecir_fuera_de_muestra(
+        lambda: crear_logistica(FEATURES_PRIMER_INTENTO, FEATURE_CATEGORICA),
+        train_primer_intento, FEATURES_PRIMER_INTENTO + [FEATURE_CATEGORICA],
+    )
 
     resultados = {
+        "Primer intento (logistica + 6 meses banco)": prob_primer_intento,
         "Regresion logistica (A)": prob_logistica,
         "LightGBM (A)": prob_lgbm,
         "Ensamble (A)  <- submission A": (prob_logistica + prob_lgbm) / 2,
         "Ensamble sin monto (B)  <- submission B": (prob_logistica_B + prob_lgbm_B) / 2,
         "Maximo teorico (adivinando todo)": y * 0.999,
     }
+    ganancias = {}
     for nombre, prob in resultados.items():
         auc = roc_auc_score(y, prob)
-        ganancia = simular_ganancia_como_test(train_f, prob, fraccion_presupuesto)
-        print(f"  {nombre:42s} AUC {auc:.4f} | ganancia USD {ganancia:>9,.0f}")
+        ganancias[nombre] = simular_ganancia_como_test(train_f, prob, fraccion_presupuesto)
+        print(f"  {nombre:42s} AUC {auc:.4f} | ganancia USD {ganancias[nombre]:>9,.0f}")
     print("  (Kaggle publico mide solo una parte del test, por eso alli el numero es menor.)")
+
+    print("\n--- GRAFICOS ---")
+    CARPETA_GRAFICOS.mkdir(exist_ok=True)
+    promedios = grafico_pagan_vs_no_pagan(train, bancario, CARPETA_GRAFICOS / "pagan_vs_no_pagan.png")
+    print(f"  pagan_vs_no_pagan.png: saldo {promedios.loc[1, 'Saldo']:,.0f} vs {promedios.loc[0, 'Saldo']:,.0f} USD | "
+          f"atraso {promedios.loc[1, 'Atraso']:.1f} vs {promedios.loc[0, 'Atraso']:.1f} dias")
+    grafico_escala_y_ganancia(train, test, factor_monto, {
+        "Primer intento": ganancias["Primer intento (logistica + 6 meses banco)"],
+        "Nuestro modelo": ganancias["Ensamble (A)  <- submission A"],
+        "Máximo posible": ganancias["Maximo teorico (adivinando todo)"],
+    }, CARPETA_GRAFICOS / "escala_y_ganancia.png")
+    print("  escala_y_ganancia.png")
 
     print("\n--- SUBMISSIONS ---")
     for nombre_archivo, features, columnas in [

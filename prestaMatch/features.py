@@ -89,3 +89,27 @@ FEATURES_BASE = [
 ]
 
 FEATURE_CATEGORICA = "Motivo_Prestamo"
+
+
+FEATURES_PRIMER_INTENTO = [
+    "Monto_Solicitado", "Tasa_Interes", "Ingreso_Mensual", "Relacion_Monto_Ingreso",
+    "Saldo_Promedio_6m", "Saldo_Desviacion_6m", "Atraso_Maximo_6m", "Proporcion_Meses_Atraso_6m", "Meses_Observados_6m",
+]
+
+
+def construir_features_primer_intento(solicitudes, bancario):
+    cruces = solicitudes[["ID_Solicitud", "ID_Usuario", "Fecha_Solicitud"]].merge(bancario, on="ID_Usuario")
+    inicio = cruces["Fecha_Solicitud"] - pd.DateOffset(months=6)
+    anteriores = cruces[(cruces["Mes_Referencia"] >= inicio) & (cruces["Mes_Referencia"] < cruces["Fecha_Solicitud"])].copy()
+    anteriores["Tuvo_Atraso"] = anteriores["Dias_Atraso_Otras_Deudas"] > 0
+    resumen = anteriores.groupby("ID_Solicitud").agg(
+        Saldo_Promedio_6m=("Saldo_Promedio_Mensual", "mean"),
+        Saldo_Desviacion_6m=("Saldo_Promedio_Mensual", "std"),
+        Atraso_Maximo_6m=("Dias_Atraso_Otras_Deudas", "max"),
+        Proporcion_Meses_Atraso_6m=("Tuvo_Atraso", "mean"),
+        Meses_Observados_6m=("Tuvo_Atraso", "count"),
+    )
+    df = solicitudes.merge(resumen, left_on="ID_Solicitud", right_index=True, how="left")
+    df[FEATURES_PRIMER_INTENTO[4:]] = df[FEATURES_PRIMER_INTENTO[4:]].fillna(0)
+    df["Relacion_Monto_Ingreso"] = df["Monto_Solicitado"] / df["Ingreso_Mensual"]
+    return df
